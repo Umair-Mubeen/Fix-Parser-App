@@ -1,0 +1,235 @@
+To parse FIX messages using Django forms and save the output to a file, we can create a Django web application with a form where users can upload the input file and the data dictionary. The application will then process the uploaded files and generate the desired output.
+
+Here's a step-by-step guide:
+
+1. **Create the Django project and app**:
+
+    ```bash
+    django-admin startproject fixparser
+    cd fixparser
+    python manage.py startapp parser
+    ```
+
+2. **Add the app to `INSTALLED_APPS` in `fixparser/settings.py`**:
+
+    ```python
+    INSTALLED_APPS = [
+        ...
+        'parser',
+    ]
+    ```
+
+3. **Create the form for file upload**:
+
+    In `parser/forms.py`:
+
+    ```python
+    from django import forms
+
+    class FIXForm(forms.Form):
+        input_file = forms.FileField(label='Input File')
+        data_dictionary = forms.FileField(label='Data Dictionary')
+        hide_enums = forms.BooleanField(required=False, label='Hide Enums')
+        row_lines = forms.BooleanField(required=False, label='Row Lines')
+    ```
+
+4. **Create the view to handle the form submission**:
+
+    In `parser/views.py`:
+
+    ```python
+    import os
+    import xml.etree.ElementTree as ET
+    from django.shortcuts import render
+    from django.http import HttpResponse
+    from .forms import FIXForm
+
+    def parse_fix_message(request):
+        if request.method == 'POST':
+            form = FIXForm(request.POST, request.FILES)
+            if form.is_valid():
+                input_file = request.FILES['input_file']
+                data_dictionary_file = request.FILES['data_dictionary']
+                hide_enums = form.cleaned_data['hide_enums']
+                row_lines = form.cleaned_data['row_lines']
+
+                # Save the uploaded files temporarily
+                input_file_path = save_temp_file(input_file)
+                data_dictionary_path = save_temp_file(data_dictionary_file)
+
+                # Process the files
+                output_content = parse_fix(input_file_path, data_dictionary_path, hide_enums, row_lines)
+
+                # Remove the temporary files
+                os.remove(input_file_path)
+                os.remove(data_dictionary_path)
+
+                # Return the output as a downloadable file
+                response = HttpResponse(output_content, content_type='text/plain')
+                response['Content-Disposition'] = 'attachment; filename="output.txt"'
+                return response
+        else:
+            form = FIXForm()
+
+        return render(request, 'parser/parse_fix_message.html', {'form': form})
+
+    def save_temp_file(file):
+        file_path = f'/tmp/{file.name}'
+        with open(file_path, 'wb+') as destination:
+            for chunk in file.chunks():
+                destination.write(chunk)
+        return file_path
+
+    def parse_fix(input_file_path, data_dictionary_path, hide_enums, row_lines):
+        parser = FIXParser(input_file_path, data_dictionary_path, hide_enums, row_lines)
+        parser.build_row_separator()
+        parser.build_msg_separator()
+        parser.init_fields()
+        return parser.parse_input_file()
+
+    class FIXParser:
+        tag_column_length = 5
+        field_name_column_length = 23
+        trailing_column_length = 65
+        msg_separator_length = 100
+
+        def __init__(self, input_file, data_dictionary, hide_enums, row_lines):
+            self.input_file = input_file
+            self.data_dictionary = data_dictionary
+            self.hide_enums = hide_enums
+            self.row_lines = row_lines
+            self.fields = None
+            self.msg_separator = None
+            self.row_separator = None
+
+        def build_row_separator(self):
+            self.row_separator = "-" * self.tag_column_length + "-+-" + \
+                                 "-" * self.field_name_column_length + "-+-" + \
+                                 "-" * self.trailing_column_length + "\n"
+
+        def build_msg_separator(self):
+            self.msg_separator = "." * self.msg_separator_length + "\n"
+
+        def init_fields(self):
+            tree = ET.parse(self.data_dictionary)
+            root = tree.getroot()
+            for child in root:
+                if child.tag == "fields":
+                    self.fields = child
+
+        def get_enum_str(self, tag_number, tag_value):
+            enums = ""
+            field = self.fields.find(f"./field[@number='{tag_number}']")
+            if field:
+                meaning = field.find(f"./value[@enum='{tag_value}']")
+                if meaning:
+                    enums += " (" + meaning.get("description") + ")"
+                else:
+                    enums += " (ERROR: NO MATCHING ENUM. CHECK DICTIONARY)"
+                if field:
+                    enum_padding = self.trailing_column_length - len(enums)
+                    enums += " " * enum_padding
+                    for enum in field:
+                        enums += enum.get("enum") + " : " + enum.get("description") + ", "
+            return enums
+
+        def make_readable(self, tags):
+            output = ''
+            if self.row_lines:
+                output += self.row_separator
+
+            for tag in tags:
+                pair = tag.split("=")
+                if len(pair) == 1:
+                    continue
+
+                tag_number = pair[0]
+                tag_name = self.fields.find(f"./field[@number='{tag_number}']").get("name")
+                tag_value = pair[1]
+
+                padding1_len = self.tag_column_length - len(tag_number)
+                padding1 = " " * padding1_len
+
+                padding2_len = self.field_name_column_length - len(tag_name)
+                padding2 = " " * padding2_len
+
+                enums = ""
+                if not self.hide_enums:
+                    enums = self.get_enum_str(tag_number, tag_value)
+
+                line = f"{tag_number}{padding1} | {tag_name}{padding2} | {tag_value}{enums}\n"
+                output += line
+                if self.row_lines:
+                    output += self.row_separator
+            return output
+
+        def parse_input_file(self):
+            output = ''
+            with open(self.input_file, "r") as input_file:
+                for line in input_file:
+                    line = line.strip()
+                    if line == "" or line[0] == "#":
+                        continue
+                    tags = line.split("")
+                    output += self.make_readable(tags)
+                    output += self.msg_separator
+            return output
+    ```
+
+5. **Create the template for the form**:
+
+    In `parser/templates/parser/parse_fix_message.html`:
+
+    ```html
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Parse FIX Messages</title>
+    </head>
+    <body>
+        <h1>Parse FIX Messages</h1>
+        <form method="post" enctype="multipart/form-data">
+            {% csrf_token %}
+            {{ form.as_p }}
+            <button type="submit">Submit</button>
+        </form>
+    </body>
+    </html>
+    ```
+
+6. **Configure the URL routing**:
+
+    In `parser/urls.py`:
+
+    ```python
+    from django.urls import path
+    from .views import parse_fix_message
+
+    urlpatterns = [
+        path('parse/', parse_fix_message, name='parse_fix_message'),
+    ]
+    ```
+
+    In `fixparser/urls.py`:
+
+    ```python
+    from django.contrib import admin
+    from django.urls import include, path
+
+    urlpatterns = [
+        path('admin/', admin.site.urls),
+        path('parser/', include('parser.urls')),
+    ]
+    ```
+
+7. **Run the Django development server**:
+
+    ```bash
+    python manage.py runserver
+    ```
+
+8. **Access the form**:
+
+    Open your web browser and go to `http://127.0.0.1:8000/parser/parse/`. You should see the form for uploading the input file and data dictionary.
+
+This implementation allows you to parse FIX messages using a web form, process the uploaded files, and provide the parsed output as a downloadable text file.
